@@ -54,6 +54,16 @@ provide an empty list.
             "name_tpl": "os-disk-{vm_name}",
             "url_tpl": "https://testubuntug7v8mk8o.blob.core.windows.net/vhds/{vm_name}.vhd"
         },
+        "data_disks": [
+            {
+                "url_tpl": "https://testubuntug7v8mk8o.blob.core.windows.net/vhds/data-a-{vm_name}.vhd",
+                "size_gb": 5
+            },
+            {
+                "url_tpl": "https://testubuntug7v8mk8o.blob.core.windows.net/vhds/data-b-{vm_name}.vhd",
+                "size_gb": 10
+            }
+        ],
         "system": {
             "host_name_tpl": "{vm_name}",
             "user_data_tpl": "#cloud-config\nssh_import_id: [torozco]\npackages:\n  - apache2"

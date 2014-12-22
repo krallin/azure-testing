@@ -137,6 +137,24 @@ def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
     )
 
 
+    #############################
+    # Extra Disks Configuration #
+    #############################
+    # NOTE: Same as above
+
+    # Configure some extra disks for this host. Note that there are some limitations on the number of disks that may be
+    # attached to a VM: http://msdn.microsoft.com/en-us/library/dn197896.aspx
+
+    extra_disks_configuration = DataVirtualHardDisks()
+    for i, disk_config in enumerate(vm_config.data_disks):
+        # It is beyond me why the SDK doesn't allow us to configure this disk through the constructor.
+        disk = DataVirtualHardDisk()
+        disk.lun = i
+        disk.media_link = disk_config.url_tpl.format(**format_kwargs)
+        disk.logical_disk_size_in_gb = disk_config.size_gb
+        extra_disks_configuration.data_virtual_hard_disks.append(disk)
+
+
     ####################
     # OS Configuration #
     ####################
@@ -180,6 +198,7 @@ def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
         # Actual VM creation params
         "role_name" : vm_name,
         "os_virtual_hard_disk" : root_disk_configuration,
+        "data_virtual_hard_disks": extra_disks_configuration,
         "system_config" : system_configuration,
         "network_config" : network_configuration,
 
@@ -268,6 +287,7 @@ def teardown_hosted_service(sms, service_name):
             # Note that we cannot delete individual VMs here: the last VM cannot be deleted
             # unelss we also delete the deployment.
             disks_to_delete.append(role.os_virtual_hard_disk)
+            disks_to_delete.extend(role.data_virtual_hard_disks)
 
         logger.info("Deleting Deployment '%s'", deployment.name)
         op = sms.delete_deployment(service_name, deployment.name)
