@@ -71,7 +71,7 @@ def create_hosted_service(sms, service_name, service_location):
             logger.warning("Service '%s' exists, but its Location is '%s', not: %s'.", service_name, real_location, service_location)
 
 
-def deploy_vm(sms, service_name, deployment_name, vm_config):
+def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
     vm_name = random_vm_name()
     format_kwargs = {
         "vm_name": vm_name,
@@ -164,9 +164,9 @@ def deploy_vm(sms, service_name, deployment_name, vm_config):
         method = sms.create_virtual_machine_deployment
         kwargs.update({
             # Deployment creation params
-            "deployment_slot" : "Production",
+            "deployment_slot" : "Production",  # VM Deployments don't support swapping; this has to be "Production"
             "label" : vm_name,
-            "virtual_network_name" : vm_config.net.network_name,
+            "virtual_network_name" : network_name,
         })
     else:
         method = sms.add_role
@@ -277,7 +277,8 @@ if __name__ == "__main__":
     config_keys = [
             "subscription_id", "certificate_path",
             "service_name", "service_location",
-            "deployment_name", "n_vms"]
+            "deployment_name", "network_name",
+            "n_vms"]
     with open(ns.config) as f:
         config = json.load(f)
     for cnf_key in config_keys:
@@ -299,7 +300,7 @@ if __name__ == "__main__":
         create_hosted_service(sms, service_name, service_location)
 
         for _ in range(n_vms):
-            deploy_vm(sms, service_name, deployment_name, vm_config)
+            deploy_vm(sms, service_name, deployment_name, network_name, vm_config)
 
     if ns.test_ssh:
         test_ssh(sms, service_name, deployment_name)

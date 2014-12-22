@@ -21,6 +21,7 @@ The one passed to `--config`, which is expected to look like this:
         "service_name": "< name to give to the Hosted Service to wrap the instances in >",
         "service_location": "< Azure region name to deploy the Hosted Service in >",
         "deployment_name": "< name to give to the Deployment to wrap the instances in >",
+        "network_name": "< name of an existing Virtual Network to place the Deployment in >"
 
         "n_vms": < number of VMs to deploy (don't quote it!) >
     }
@@ -45,7 +46,6 @@ provide an empty list.
                   "lb": true
                 }
             ],
-            "network_name": "Group Group thomas-tests",
             "subnet_names": ["Subnet-1"],
             "public_ip_name_tpls": ["ip-{vm_name}"]
         },
