@@ -87,12 +87,21 @@ def deploy_vm(sms, service_name, deployment_name, vm_config):
     network_configuration = ConfigurationSet()
 
     for nat_port in vm_config.net.nat_ports:
-        network_configuration.input_endpoints.input_endpoints.append(ConfigurationSetInputEndpoint(
-            name = nat_port.name,
-            protocol = nat_port.protocol,
-            local_port = nat_port.port,
-            port = random_port(),
-        ))
+        nat_port_kwargs = {
+            "name": nat_port.name,
+            "protocol": nat_port.protocol,
+            "local_port": nat_port.port
+        }
+        if nat_port.lb:
+            nat_port_kwargs.update({
+                "port": nat_port.port,
+                "load_balanced_endpoint_set_name": "lb-{0}".format(nat_port.name)
+            })
+        else:
+            nat_port_kwargs.update({
+                "port": random_port()
+            })
+        network_configuration.input_endpoints.input_endpoints.append(ConfigurationSetInputEndpoint(**nat_port_kwargs))
 
     for subnet_name in vm_config.net.subnet_names:
         network_configuration.subnet_names.append(subnet_name)

@@ -33,9 +33,16 @@ provide an empty list.
         "net": {
             "nat_ports": [
                 {
-                    "name": "port-ssh",
+                    "name": "ssh",
                     "protocol": "tcp",
-                    "port": 22
+                    "port": 22,
+                    "lb": false
+                },
+                {
+                  "name": "http",
+                  "protocol": "tcp",
+                  "port": 80,
+                  "lb": true
                 }
             ],
             "network_name": "Group Group thomas-tests",
@@ -49,7 +56,7 @@ provide an empty list.
         },
         "system": {
             "host_name_tpl": "{vm_name}",
-            "user_data_tpl": "#cloud-config\nssh_import_id: [torozco]\n"
+            "user_data_tpl": "#cloud-config\nssh_import_id: [torozco]\npackages:\n  - apache2"
         },
         "size": "Small"
     }
@@ -64,4 +71,4 @@ Usage
 
 To provision, test, and then teardown your cluster, use:
 
-    python main.py -c config.json --provision vm_config.json --test-ssh --teardown
+    python main.py --config config.json --provision vm_config.json --test-ssh --teardown
