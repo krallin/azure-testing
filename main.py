@@ -10,31 +10,12 @@ import base64
 import uuid
 import time
 
+from attrdict import load as attrdict_load
 from azure import *
 from azure.servicemanagement import *
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-
-# TODO - Actually pass those as parameters!
-VM_SIZE = "Small"
-
-# Images are a resource that span services
-IMAGE_NAME = "b39f27a8b8c64d52b05eac6a62ebad85__Ubuntu-14_04_1-LTS-amd64-server-20141125-en-us-30GB"
-
-# Networks are a resource that span services
-NET_NAME = "Group Group thomas-tests"
-NET_SUBNET = "Subnet-1"
-
-# If using an Image
-# Not a good idea, because there are no VM images for Ubuntu!!! (only a few SQL Server and HortonWorks boxes)
-# Containers are a resource that span services
-BLOB_CONTAINER = "https://testubuntug7v8mk8o.blob.core.windows.net/vhds/"
-
-CLOUD_INIT_CUSTOM_DATA = """#cloud-config
-ssh_import_id: [torozco]
-"""
 
 
 def ssh_up(name, host, port, timeout=5):
@@ -77,17 +58,6 @@ def wait_for_operation(operation):
     logger.info("Operation '%s' completed with '%s'", operation.request_id, status.status)
 
 
-def _get_os_disk_configuration_for_vm(vm_name):
-    disk_name = "os-disk-{0}".format(vm_name)
-    disk_url = "{0}/{1}.vhd".format(BLOB_CONTAINER, vm_name)  # /!\ This must be found under /vhds/ !! Can't use the root
-
-    return OSVirtualHardDisk(
-        source_image_name=IMAGE_NAME,
-        disk_name=disk_name,
-        media_link=disk_url
-    )
-
-
 def create_hosted_service(sms, service_name, service_location):
     # Does the service exist?
     try:
@@ -101,43 +71,81 @@ def create_hosted_service(sms, service_name, service_location):
             logger.warning("Service '%s' exists, but its Location is '%s', not: %s'.", service_name, real_location, service_location)
 
 
-def deploy_vm(sms, service_name, deployment_name, vm_name, nat_ssh_port):
-    # http://msdn.microsoft.com/en-us/library/azure/jj157194.aspx#bk_rolelist
-    network_config = ConfigurationSet()
-    network_config.input_endpoints.input_endpoints.append(ConfigurationSetInputEndpoint(
-        name = "ssh",
-        protocol = "tcp",
-        local_port = 22,
-        port = nat_ssh_port,
-    ))
-    network_config.subnet_names.append(NET_SUBNET)  # TODO
+def deploy_vm(sms, service_name, deployment_name, vm_config):
+    vm_name = random_vm_name()
+    format_kwargs = {
+        "vm_name": vm_name,
+        "vm_config": vm_config
+    }
+    logger.info("Deploying '%s' in '%s' / '%s'", vm_name, service_name, deployment_name)
+
+    #########################
+    # Network Configuration #
+    #########################
+    # NOTE: This only depends on vm_name and vm_config, so it could be extracted into a function
+
+    network_configuration = ConfigurationSet()
+
+    for nat_port in vm_config.net.nat_ports:
+        network_configuration.input_endpoints.input_endpoints.append(ConfigurationSetInputEndpoint(
+            name = nat_port.name,
+            protocol = nat_port.protocol,
+            local_port = nat_port.port,
+            port = random_port(),
+        ))
+
+    for subnet_name in vm_config.net.subnet_names:
+        network_configuration.subnet_names.append(subnet_name)
+
     # Note that for some reason, not giving the IPs a name results in some form of conflict (which does *not* throw an error),
     # where only one instance will get a Public IP. Giving the IPs a name seems to resolve the issue (note that it doesn't seem to
     # matter whether that name is unique or not, but if we're giving the IP a name, we might as well make it unique)
-    network_config.public_ips.public_ips.append(PublicIP(name="ip-{0}".format(vm_name)))
+
+    for public_ip_name_tpl in vm_config.net.public_ip_name_tpls:
+        network_configuration.public_ips.public_ips.append(PublicIP(name=public_ip_name_tpl.format(**format_kwargs)))
+
+
+    ###########################
+    # Root Disk Configuration #
+    ###########################
+    # NOTE: Same as above
+
+    root_disk_configuration = OSVirtualHardDisk(
+        source_image_name = vm_config.root_disk.source_image,
+        disk_name = vm_config.root_disk.name_tpl.format(**format_kwargs),
+        media_link = vm_config.root_disk.url_tpl.format(**format_kwargs)
+    )
+
+
+    ####################
+    # OS Configuration #
+    ####################
+    # NOTE: Same as above
+
+    system_configuration = LinuxConfigurationSet(
+        # Plenty of stuff we don't need!
+        user_name = "thomas",
+        user_password = base64.b64encode(open("/dev/urandom").read(32)),
+        disable_ssh_password_authentication = True,
+
+        # Finally, something we need!
+        host_name = vm_config.system.host_name_tpl.format(**format_kwargs),
+        custom_data = vm_config.system.user_data_tpl.format(**format_kwargs),
+    )
+
 
     kwargs = {
+        # Identify what this VM belongs to
         "service_name" : service_name,
         "deployment_name" : deployment_name,
 
-        # Actual VM params
+        # Actual VM creation params
         "role_name" : vm_name,
+        "os_virtual_hard_disk" : root_disk_configuration,
+        "system_config" : system_configuration,
+        "network_config" : network_configuration,
 
-        "os_virtual_hard_disk" : _get_os_disk_configuration_for_vm(vm_name),
-
-        "system_config" : LinuxConfigurationSet(
-            # Plenty of stuff we don't need!
-            host_name = vm_name,
-            user_name = "thomas",
-            user_password = base64.b64encode(open("/dev/urandom").read(32)),
-            disable_ssh_password_authentication = True,
-
-            # Finally, something we need!
-            custom_data = CLOUD_INIT_CUSTOM_DATA,
-        ),
-        "network_config" : network_config,
-
-        "role_size" : VM_SIZE,
+        "role_size" : vm_config.size,
     }
 
     try:
@@ -146,23 +154,17 @@ def deploy_vm(sms, service_name, deployment_name, vm_name, nat_ssh_port):
         logger.info("Deployment '%s' does not exist in Service '%s'", deployment_name, service_name)
         method = sms.create_virtual_machine_deployment
         kwargs.update({
+            # Deployment creation params
             "deployment_slot" : "Production",
             "label" : vm_name,
-            "virtual_network_name" : NET_NAME,
+            "virtual_network_name" : vm_config.net.network_name,
         })
     else:
         method = sms.add_role
 
-    logger.info("Creating VM: %s", vm_name)
-
     operation = method(**kwargs)
-
-    try:
-        wait_for_operation(operation)
-    except OperationFailed as e:
-        logger.error("An error occured: '%s'", e.message)
-    else:
-        logger.info("VM '%s' is ready, ssh to '%s.cloudapp.net -p %s'", vm_name, service_name, nat_ssh_port)
+    wait_for_operation(operation)
+    logger.info("VM '%s' is ready", vm_name)
 
 
 def ping_vms(sms, service_name, deployment_name):
@@ -246,7 +248,7 @@ def teardown_hosted_service(sms, service_name):
 def random_vm_name():
     return str(uuid.uuid4())
 
-def random_vm_port():
+def random_port():
     return random.randint(2**12, 2**16) - 1
 
 
@@ -257,19 +259,18 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", required=True)
-    parser.add_argument('--provision', action='store_true')
+    parser.add_argument('--provision', dest="vm_config")
     parser.add_argument('--ping', action='store_true')
     parser.add_argument('--teardown', action='store_true')
     ns = parser.parse_args()
-
-    with open(ns.config) as f:
-        config = json.load(f)
 
     # Those keys MUST be in the configuration file
     config_keys = [
             "subscription_id", "certificate_path",
             "service_name", "service_location",
             "deployment_name", "n_vms"]
+    with open(ns.config) as f:
+        config = json.load(f)
     for cnf_key in config_keys:
         try:
             locals()[cnf_key] = config[cnf_key]
@@ -283,12 +284,13 @@ if __name__ == "__main__":
 
     sms = ServiceManagementService(subscription_id, certificate_path)
 
-    if ns.provision:
+    if ns.vm_config:
+        vm_config = attrdict_load(ns.vm_config)
+
         create_hosted_service(sms, service_name, service_location)
 
-        vm_configs = [(random_vm_name(), random_vm_port()) for _ in range(n_vms)]
-        for vm_config in vm_configs:
-            deploy_vm(sms, service_name, deployment_name, *vm_config)
+        for _ in range(n_vms):
+            deploy_vm(sms, service_name, deployment_name, vm_config)
 
     if ns.ping:
         ping_vms(sms, service_name, deployment_name)
