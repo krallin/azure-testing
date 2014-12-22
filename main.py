@@ -40,7 +40,7 @@ class OperationFailed(Exception):
         self.code = code
         self.message = message
 
-    def __repr__(self):
+    def __str__(self):
         return "{0} ({1})".format(self.code, self.message)
 
 
@@ -53,7 +53,8 @@ def wait_for_operation(operation):
         time.sleep(1)
 
     if status.error is not None:
-        raise Operation(status.error.code, status.error.message)
+        logger.error("Request failed: %s (%s)", status.error.code, status.error.message)
+        raise OperationFailed(status.error.code, status.error.message)
 
     logger.info("Operation '%s' completed with '%s'", operation.request_id, status.status)
 
