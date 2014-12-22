@@ -167,32 +167,32 @@ def deploy_vm(sms, service_name, deployment_name, vm_config):
     logger.info("VM '%s' is ready", vm_name)
 
 
-def ping_vms(sms, service_name, deployment_name):
+def test_ssh(sms, service_name, deployment_name):
     logger.info("Retrieving list of VMs and ports")
     deployment = sms.get_deployment_by_name(service_name, deployment_name)
-    ping_targets = []
+    ssh_targets = []
 
     for vm in deployment.role_instance_list:
         for endpoint in vm.instance_endpoints:
             # Note: the endpoint ports are strings. Not that this makes sense, but we have to convert
             # those to ints.
             if int(endpoint.local_port) == 22:
-                ping_targets.append((vm.instance_name, endpoint.vip, int(endpoint.public_port)))
+                ssh_targets.append((vm.instance_name, endpoint.vip, int(endpoint.public_port)))
         if not vm.public_ips:
             logger.warning("VM %s has no public IPs", vm.instance_name)
         else:
             for public_ip in vm.public_ips:
-                ping_targets.append((vm.instance_name, public_ip.address, 22))
+                ssh_targets.append((vm.instance_name, public_ip.address, 22))
 
-    logger.info("Ping Targets: %s", ping_targets)
-    while ping_targets:
-        ping_target = ping_targets.pop(0)
-        logger.debug("Trying to hit SSH on %s at %s:%s", *ping_target)
-        if ssh_up(*ping_target):
-            logger.info("SSH is up on %s at %s:%s", *ping_target)
+    logger.info("SSH Targets: %s", ssh_targets)
+    while ssh_targets:
+        ssh_target = ssh_targets.pop(0)
+        logger.debug("Trying to hit SSH on %s at %s:%s", *ssh_target)
+        if ssh_up(*ssh_target):
+            logger.info("SSH is up on %s at %s:%s", *ssh_target)
         else:
-            logger.info("SSH is not up on %s at %s:%s", *ping_target)
-            ping_targets.append(ping_target)
+            logger.info("SSH is not up on %s at %s:%s", *ssh_target)
+            ssh_targets.append(ssh_target)
             time.sleep(1)
 
 
@@ -260,7 +260,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument('--provision', dest="vm_config")
-    parser.add_argument('--ping', action='store_true')
+    parser.add_argument('--test-ssh', action='store_true')
     parser.add_argument('--teardown', action='store_true')
     ns = parser.parse_args()
 
@@ -292,8 +292,8 @@ if __name__ == "__main__":
         for _ in range(n_vms):
             deploy_vm(sms, service_name, deployment_name, vm_config)
 
-    if ns.ping:
-        ping_vms(sms, service_name, deployment_name)
+    if ns.test_ssh:
+        test_ssh(sms, service_name, deployment_name)
 
     if ns.teardown:
         teardown_hosted_service(sms, service_name)

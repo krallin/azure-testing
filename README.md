@@ -64,4 +64,4 @@ Usage
 
 To provision, test, and then teardown your cluster, use:
 
-    python main.py -c config.json --provision vm_config.json --ping --teardown
+    python main.py -c config.json --provision vm_config.json --test-ssh --teardown
