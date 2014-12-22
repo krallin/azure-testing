@@ -110,6 +110,8 @@ def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
 
     for subnet_name in vm_config.net.subnet_names:
         # All these Subnets must belong to the Virtual Network used for the VM Deployment.
+        # Note that it appears that providing multiple subnets is not useful, and results in the
+        # first subnet only being used (at least according to the console).
         network_configuration.subnet_names.append(subnet_name)
 
     for public_ip_name_tpl in vm_config.net.public_ip_name_tpls:
