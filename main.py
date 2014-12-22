@@ -1,4 +1,9 @@
+#coding:utf-8
+import sys
 import os
+import argparse
+import json
+import socket
 import logging
 import random
 import base64
@@ -12,43 +17,42 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-subscription_id = "<sub-id>"
-certificate_path = os.path.join(os.path.dirname(__file__), "mycert.pem")
-
-sms = ServiceManagementService(subscription_id, certificate_path)
-
-SERVICE_NAME = "scalr-test-5"
-DEPLOYMENT_NAME = "vm-group"
-
+# TODO - Actually pass those as parameters!
 VM_SIZE = "Small"
 
-SERVICE_LOCATION = "West Europe"  # Location ends up controlled by service.
-
+# Images are a resource that span services
 IMAGE_NAME = "b39f27a8b8c64d52b05eac6a62ebad85__Ubuntu-14_04_1-LTS-amd64-server-20141125-en-us-30GB"
+
+# Networks are a resource that span services
 NET_NAME = "Group Group thomas-tests"
+NET_SUBNET = "Subnet-1"
 
 # If using an Image
 # Not a good idea, because there are no VM images for Ubuntu!!! (only a few SQL Server and HortonWorks boxes)
+# Containers are a resource that span services
 BLOB_CONTAINER = "https://testubuntug7v8mk8o.blob.core.windows.net/vhds/"
 
 CLOUD_INIT_CUSTOM_DATA = """#cloud-config
 ssh_import_id: [torozco]
 """
-# In Theory: http://azure.microsoft.com/blog/2014/04/21/custom-data-and-cloud-init-on-windows-azure/
 
-#for img in sms.list_vm_images():
-#    print img.name, img.publisher_name
-#    print img.__dict__
-#    print
-#exit(0)
 
-#for net in sms.list_virtual_network_sites():
-#    print net.name
-#    for subnet in net.subnets:
-#        print subnet.name, subnet.address_prefix
-#
-#ubuntu = sms.get_os_image(IMAGE_NAME)
-#print ubuntu.__dict__
+def ssh_up(name, host, port, timeout=5):
+    try:
+        s = socket.create_connection((host, port), timeout)
+        s.settimeout(timeout)
+        data = s.recv(64).strip()
+    except (socket.error, socket.timeout) as e:
+        logger.debug("SSH connection failed with: %s", e)
+        return False
+
+    if not data.startswith('SSH'):
+        logger.warning("SSH did not respond with 'SSH' header: '%s'", data)
+        return False
+
+    logger.debug("SSH responded with 'SSH' header: '%s'", data)
+    return True
+
 
 class OperationFailed(Exception):
     def __init__(self, code, message):
@@ -70,7 +74,7 @@ def wait_for_operation(operation):
     if status.error is not None:
         raise Operation(status.error.code, status.error.message)
 
-    logger.debug("Operation '%s' completed with '%s'", operation.request_id, status.status)
+    logger.info("Operation '%s' completed with '%s'", operation.request_id, status.status)
 
 
 def _get_os_disk_configuration_for_vm(vm_name):
@@ -84,32 +88,37 @@ def _get_os_disk_configuration_for_vm(vm_name):
     )
 
 
-def deploy_vm(vm_name, vm_ssh_port):
+def create_hosted_service(sms, service_name, service_location):
     # Does the service exist?
     try:
-        service = sms.get_hosted_service_properties(SERVICE_NAME)
+        service = sms.get_hosted_service_properties(service_name)
     except WindowsAzureMissingResourceError:
-        logger.info("Service '%s' does not exist, creating", SERVICE_NAME)
-        sms.create_hosted_service(service_name=SERVICE_NAME, label=SERVICE_NAME, location=SERVICE_LOCATION)
+        logger.info("Service '%s' does not exist, creating", service_name)
+        sms.create_hosted_service(service_name=service_name, label=service_name, location=service_location)
     else:
         real_location = service.hosted_service_properties.location
-        if real_location != SERVICE_LOCATION:
-            logger.warning("Service '%s' exists, but its Location is '%s', not: %s'.", SERVICE_NAME, real_location, SERVICE_LOCATION)
+        if real_location != service_location:
+            logger.warning("Service '%s' exists, but its Location is '%s', not: %s'.", service_name, real_location, service_location)
 
 
+def deploy_vm(sms, service_name, deployment_name, vm_name, nat_ssh_port):
     # http://msdn.microsoft.com/en-us/library/azure/jj157194.aspx#bk_rolelist
     network_config = ConfigurationSet()
     network_config.input_endpoints.input_endpoints.append(ConfigurationSetInputEndpoint(
         name = "ssh",
         protocol = "tcp",
         local_port = 22,
-        port = vm_ssh_port,
+        port = nat_ssh_port,
     ))
-    network_config.subnet_names.append("Subnet-1")          # Deploy in subnet 1
+    network_config.subnet_names.append(NET_SUBNET)  # TODO
+    # Note that for some reason, not giving the IPs a name results in some form of conflict (which does *not* throw an error),
+    # where only one instance will get a Public IP. Giving the IPs a name seems to resolve the issue (note that it doesn't seem to
+    # matter whether that name is unique or not, but if we're giving the IP a name, we might as well make it unique)
+    network_config.public_ips.public_ips.append(PublicIP(name="ip-{0}".format(vm_name)))
 
     kwargs = {
-        "service_name" : SERVICE_NAME,
-        "deployment_name" : DEPLOYMENT_NAME,
+        "service_name" : service_name,
+        "deployment_name" : deployment_name,
 
         # Actual VM params
         "role_name" : vm_name,
@@ -117,21 +126,24 @@ def deploy_vm(vm_name, vm_ssh_port):
         "os_virtual_hard_disk" : _get_os_disk_configuration_for_vm(vm_name),
 
         "system_config" : LinuxConfigurationSet(
+            # Plenty of stuff we don't need!
             host_name = vm_name,
-            user_name = "thomas",                           # Literally stuff you don't need
+            user_name = "thomas",
             user_password = base64.b64encode(open("/dev/urandom").read(32)),
             disable_ssh_password_authentication = True,
-            custom_data = CLOUD_INIT_CUSTOM_DATA,           # Crossing fingers
+
+            # Finally, something we need!
+            custom_data = CLOUD_INIT_CUSTOM_DATA,
         ),
         "network_config" : network_config,
 
-        "role_size" : VM_SIZE,                                # Is this actually the instance type?!
+        "role_size" : VM_SIZE,
     }
 
     try:
-        deployment = sms.get_deployment_by_name(SERVICE_NAME, DEPLOYMENT_NAME)
+        deployment = sms.get_deployment_by_name(service_name, deployment_name)
     except WindowsAzureMissingResourceError:
-        logger.info("Deployment '%s' does not exist in Service '%s'", DEPLOYMENT_NAME, SERVICE_NAME)
+        logger.info("Deployment '%s' does not exist in Service '%s'", deployment_name, service_name)
         method = sms.create_virtual_machine_deployment
         kwargs.update({
             "deployment_slot" : "Production",
@@ -150,14 +162,43 @@ def deploy_vm(vm_name, vm_ssh_port):
     except OperationFailed as e:
         logger.error("An error occured: '%s'", e.message)
     else:
-        logger.info("VM '%s' is ready, ssh to '%s.cloudapp.net -p %s'", vm_name, SERVICE_NAME, vm_ssh_port)
+        logger.info("VM '%s' is ready, ssh to '%s.cloudapp.net -p %s'", vm_name, service_name, nat_ssh_port)
 
 
-def teardown_hosted_service():
+def ping_vms(sms, service_name, deployment_name):
+    logger.info("Retrieving list of VMs and ports")
+    deployment = sms.get_deployment_by_name(service_name, deployment_name)
+    ping_targets = []
+
+    for vm in deployment.role_instance_list:
+        for endpoint in vm.instance_endpoints:
+            # Note: the endpoint ports are strings. Not that this makes sense, but we have to convert
+            # those to ints.
+            if int(endpoint.local_port) == 22:
+                ping_targets.append((vm.instance_name, endpoint.vip, int(endpoint.public_port)))
+        if not vm.public_ips:
+            logger.warning("VM %s has no public IPs", vm.instance_name)
+        else:
+            for public_ip in vm.public_ips:
+                ping_targets.append((vm.instance_name, public_ip.address, 22))
+
+    logger.info("Ping Targets: %s", ping_targets)
+    while ping_targets:
+        ping_target = ping_targets.pop(0)
+        logger.debug("Trying to hit SSH on %s at %s:%s", *ping_target)
+        if ssh_up(*ping_target):
+            logger.info("SSH is up on %s at %s:%s", *ping_target)
+        else:
+            logger.info("SSH is not up on %s at %s:%s", *ping_target)
+            ping_targets.append(ping_target)
+            time.sleep(1)
+
+
+def teardown_hosted_service(sms, service_name):
     try:
-        service = sms.get_hosted_service_properties(SERVICE_NAME, embed_detail = True)
+        service = sms.get_hosted_service_properties(service_name, embed_detail = True)
     except WindowsAzureMissingResourceError:
-        logger.info("Service '%s' was already deleted", SERVICE_NAME)
+        logger.info("Service '%s' was already deleted", service_name)
         return
 
     for deployment in service.deployments:
@@ -166,17 +207,13 @@ def teardown_hosted_service():
         # Deleting the Deployment tends to bug out and leave a few disks un-deletable for
         # while because they are still attached. We instead delete the VMs, then just poll
         # the disks until we can delete them.
-        # NO - DOESNT WORK THIS WAY. CANT DELETE THE LAST VM UNLESS I DELETE THE DEPLOYMENT.
         for role in deployment.role_list:
-            # Caution: delete_role_instances does not work for VMs!
-#            logger.info("Deleting VM '%s'", role.role_name)
-#            op = sms.delete_role(SERVICE_NAME, deployment.name, role.role_name)
-#            wait_for_operation(op)
-#
+            # Note that we cannot delete individual VMs here: the last VM cannot be deleted
+            # unelss we also delete the deployment.
             disks_to_delete.append(role.os_virtual_hard_disk)
 
         logger.info("Deleting Deployment '%s'", deployment.name)
-        op = sms.delete_deployment(SERVICE_NAME, deployment.name)
+        op = sms.delete_deployment(service_name, deployment.name)
         wait_for_operation(op)
 
         while disks_to_delete:
@@ -202,11 +239,59 @@ def teardown_hosted_service():
             sms.delete_disk(real_disk.name, delete_vhd=True)
 
 
-    logger.info("Deleting Service '%s'", deployment.name)
-    sms.delete_hosted_service(SERVICE_NAME)
+    logger.info("Deleting Service '%s'", service_name)
+    sms.delete_hosted_service(service_name)
 
 
+def random_vm_name():
+    return str(uuid.uuid4())
 
-deploy_vm(str(uuid.uuid4()), random.randint(2**12, 2**16) - 1)
-deploy_vm(str(uuid.uuid4()), random.randint(2**12, 2**16) - 1)
-teardown_hosted_service()
+def random_vm_port():
+    return random.randint(2**12, 2**16) - 1
+
+
+if __name__ == "__main__":
+    #################
+    # Configuration #
+    #################
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--config", required=True)
+    parser.add_argument('--provision', action='store_true')
+    parser.add_argument('--ping', action='store_true')
+    parser.add_argument('--teardown', action='store_true')
+    ns = parser.parse_args()
+
+    with open(ns.config) as f:
+        config = json.load(f)
+
+    # Those keys MUST be in the configuration file
+    config_keys = [
+            "subscription_id", "certificate_path",
+            "service_name", "service_location",
+            "deployment_name", "n_vms"]
+    for cnf_key in config_keys:
+        try:
+            locals()[cnf_key] = config[cnf_key]
+        except KeyError:
+            logger.error("Missing configuration key: %s", cnf_key)
+            sys.exit(1)
+
+    ###################
+    # Actual Workflow #
+    ###################
+
+    sms = ServiceManagementService(subscription_id, certificate_path)
+
+    if ns.provision:
+        create_hosted_service(sms, service_name, service_location)
+
+        vm_configs = [(random_vm_name(), random_vm_port()) for _ in range(n_vms)]
+        for vm_config in vm_configs:
+            deploy_vm(sms, service_name, deployment_name, *vm_config)
+
+    if ns.ping:
+        ping_vms(sms, service_name, deployment_name)
+
+    if ns.teardown:
+        teardown_hosted_service(sms, service_name)
