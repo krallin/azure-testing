@@ -283,14 +283,13 @@ def teardown_hosted_service(sms, service_name):
     for deployment in service.deployments:
         disks_to_delete = []
 
-        # Deleting the Deployment tends to bug out and leave a few disks un-deletable for
-        # while because they are still attached. We instead delete the VMs, then just poll
-        # the disks until we can delete them.
+        # Deleting a Deployment (or deleting VMs, for that matter) will not delete the Disks associated with them,
+        # so we start by getting a list of the Disks we'll need to cleanup.
         for role in deployment.role_list:
-            # Note that we cannot delete individual VMs here: the last VM cannot be deleted
-            # unelss we also delete the deployment.
             disks_to_delete.append(role.os_virtual_hard_disk)
             disks_to_delete.extend(role.data_virtual_hard_disks)
+            # Note that we shouldn't try to also delete the VMs here. This would fail for the last VM because you need
+            # to delete the entire Deployment when deleting the last VM.
 
         logger.info("Deleting Deployment '%s'", deployment.name)
         op = sms.delete_deployment(service_name, deployment.name)
@@ -308,13 +307,19 @@ def teardown_hosted_service(sms, service_name):
                 logger.debug("Disk '%s' was attached when we checked, waiting", candidate.name)
                 time.sleep(10)
 
-            # Check if any progress was made
+            # Although we waited for the delete operation to complete on the Deployment, Azure actually doesn't guarantee
+            # (though they don't document that anywhere) that our disks will be detached when that operation has completed.
+            # In fact, the disks will always remain attached for a little while after the VM has been deleted. We therefore
+            # poll the disks until they have finally been detached, before attempting to delete them (attempting to delete
+            # an attached disk would of course fail).
             real_disk = sms.get_disk(candidate.name)
             if real_disk.attached_to is not None:
                 logger.debug("Disk '%s' is still attached to '%s'", real_disk.name, real_disk.attached_to.role_name)
                 disks_to_delete.append(real_disk)
                 continue
 
+            # Disk is no longer attached; we can finally delete. We make sure to also delete the underlying VHD (i.e. the blob
+            # in Azure storage)
             logger.info("Deleting Disk '%s'", real_disk.name)
             sms.delete_disk(real_disk.name, delete_vhd=True)
 
