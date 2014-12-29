@@ -1,23 +1,24 @@
 #coding:utf-8
-import sys
-import os
 import argparse
-import json
+import base64
 import socket
 import logging
 import random
-import base64
 import uuid
 import time
 
 from attrdict import load as attrdict_load
-from azure import *
-from azure.servicemanagement import *
+from azure import WindowsAzureMissingResourceError
+from azure.servicemanagement import ServiceManagementService, ConfigurationSet, ConfigurationSetInputEndpoint, PublicIP, \
+    OSVirtualHardDisk, DataVirtualHardDisks, DataVirtualHardDisk, LinuxConfigurationSet
+from azure.storage import BlobService
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
+# noinspection PyUnusedLocal
 def ssh_up(name, host, port, timeout=5):
     try:
         s = socket.create_connection((host, port), timeout)
@@ -44,7 +45,8 @@ class OperationFailed(Exception):
         return "{0} ({1})".format(self.code, self.message)
 
 
-def wait_for_operation(operation):
+def wait_for_operation(sms, operation):
+
     while 1:
         status = sms.get_operation_status(operation.request_id)
         logger.debug("Operation status is '%s'", status.status)
@@ -52,11 +54,19 @@ def wait_for_operation(operation):
             break
         time.sleep(1)
 
+    # noinspection PyUnboundLocalVariable
     if status.error is not None:
         logger.error("Request failed: %s (%s)", status.error.code, status.error.message)
         raise OperationFailed(status.error.code, status.error.message)
 
     logger.info("Operation '%s' completed with '%s'", operation.request_id, status.status)
+
+
+def random_vm_name():
+    return str(uuid.uuid4())
+
+def random_port():
+    return random.randint(2**12, 2**16) - 1
 
 
 def create_hosted_service(sms, service_name, service_location):
@@ -72,13 +82,21 @@ def create_hosted_service(sms, service_name, service_location):
             logger.warning("Service '%s' exists, but its Location is '%s', not: %s'.", service_name, real_location, service_location)
 
 
-def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
+def deploy_vm(sms, bs, service_name, deployment_name, network_name, vhds_container, vm_config):
+
     vm_name = random_vm_name()
-    format_kwargs = {
-        "vm_name": vm_name,
-        "vm_config": vm_config
-    }
-    logger.info("Deploying '%s' in '%s' / '%s'", vm_name, service_name, deployment_name)
+    format_kwargs = {"vm_name": vm_name}
+
+    logger.info("Deploying '%s' in '%s/%s'", vm_name, service_name, deployment_name)
+
+    ##################
+    # Disk Container #
+    ##################
+    # We must first ensure that the container where we will place the VHDs for the VM exists. The container is a
+    # directory within the Storage Account (somewhat akin to a bucket in AWS).
+
+    bs.create_container(vhds_container, fail_on_exist=False)
+
 
     #########################
     # Network Configuration #
@@ -133,10 +151,13 @@ def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
     # In this case, our disk is a OS disk, so it also has a source Image. Source images are OS Images, and they
     # can be listed using: `sms.list_os_images()`.
 
+    disk_name = vm_config.root_disk.name_tpl.format(**format_kwargs)
+    disk_url = bs.make_blob_url(vhds_container, "{disk_name}.vhd".format(disk_name=disk_name))
+
     root_disk_configuration = OSVirtualHardDisk(
         source_image_name = vm_config.root_disk.source_image,
-        disk_name = vm_config.root_disk.name_tpl.format(**format_kwargs),
-        media_link = vm_config.root_disk.url_tpl.format(**format_kwargs)
+        disk_name = disk_name,
+        media_link = disk_url
     )
 
 
@@ -216,7 +237,7 @@ def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
     # we just add a new VM to the Deployment.
 
     try:
-        deployment = sms.get_deployment_by_name(service_name, deployment_name)
+        sms.get_deployment_by_name(service_name, deployment_name)
     except WindowsAzureMissingResourceError:
         logger.info("Deployment '%s' does not exist in Service '%s'", deployment_name, service_name)
         method = sms.create_virtual_machine_deployment
@@ -240,7 +261,7 @@ def deploy_vm(sms, service_name, deployment_name, network_name, vm_config):
 
     # Finally, we make the call. It's asynchronous, so we wait on it.
     operation = method(**kwargs)
-    wait_for_operation(operation)
+    wait_for_operation(sms, operation)
     logger.info("VM '%s' is ready", vm_name)
 
 
@@ -248,6 +269,18 @@ def test_ssh(sms, service_name, deployment_name):
     logger.info("Retrieving list of VMs and ports")
     deployment = sms.get_deployment_by_name(service_name, deployment_name)
     ssh_targets = []
+
+    # Let's stop for a minute to talk about deployment.role_instance_list and deployment.role_list.
+
+    # `deployment.role_list` is pretty much a list of what you requested when you provisioned the instance. It includes
+    # the VHDs associated with it, the configuration you passed, etc.
+
+    # `deployment.role_instance_list` corresponds to what actually exists in Azure. Among other things, this is where
+    # we can find the IP of the instance's public endpoint (the Hosted Service).
+
+    # It's also possible that one of those calls could return data for non-VM deployments (possibly role_list, which has
+    # a role_type field in the objects it returns).
+    # Fortunately, every API Call returns both items.
 
     for vm in deployment.role_instance_list:
         for endpoint in vm.instance_endpoints:
@@ -273,7 +306,8 @@ def test_ssh(sms, service_name, deployment_name):
             time.sleep(1)
 
 
-def teardown_hosted_service(sms, service_name):
+def teardown(sms, service_name):
+    # NOTE: This does NOT delete OS Images!
     try:
         service = sms.get_hosted_service_properties(service_name, embed_detail = True)
     except WindowsAzureMissingResourceError:
@@ -293,7 +327,7 @@ def teardown_hosted_service(sms, service_name):
 
         logger.info("Deleting Deployment '%s'", deployment.name)
         op = sms.delete_deployment(service_name, deployment.name)
-        wait_for_operation(op)
+        wait_for_operation(sms, op)
 
         while disks_to_delete:
             candidate = disks_to_delete.pop(0)
@@ -328,56 +362,111 @@ def teardown_hosted_service(sms, service_name):
     sms.delete_hosted_service(service_name)
 
 
-def random_vm_name():
-    return str(uuid.uuid4())
-
-def random_port():
-    return random.randint(2**12, 2**16) - 1
+def snapshot(sms, bs, service_name, deployment_name, images_container, snapshot_config):
+    # Ensure that the Images container exists
+    bs.create_container(images_container, fail_on_exist=False)
 
 
-if __name__ == "__main__":
+    # This is where things get really weird. We have two lists: one that contains root volumes, and
+    # one that contains instance states!
+    deployment = sms.get_deployment_by_name(service_name, deployment_name)
+    role_names_to_vhds = dict(((role.role_name, role.os_virtual_hard_disk) for role in deployment.role_list))
+
+    for role in deployment.role_instance_list:
+        logger.info("Preparing to snapshot '%s'. Make you sure you ran `waagent --deallocate`!", role.role_name)
+
+        if role.instance_status not in ("Stopped", "StoppedDeallocated"):
+            logger.warning("Role '%s' is in '%s' state. Snapshotting is risky!", role.role_name, role.instance_status)
+
+        # TODO - Lease problem here? Seems like there isn't.
+        root_vhd = role_names_to_vhds[role.role_name]
+
+        dst_blob_name = "image-from-{0}.vhd".format(role.role_name)
+        dst_blob_url = bs.make_blob_url(images_container, dst_blob_name)
+        bs.copy_blob(images_container, dst_blob_name, root_vhd.media_link)
+
+
+        format_kwargs = {"role": role}
+        os_label = snapshot_config.label_tpl.format(**format_kwargs)
+        os_name = snapshot_config.name_tpl.format(**format_kwargs)
+        os_type = snapshot_config.os
+
+        op = sms.add_os_image(os_label, dst_blob_url, os_name, os_type)
+        wait_for_operation(sms, op)
+
+        logger.info("Created OS: '%s'", os_name)
+
+
+def start(sms, service_name, deployment_name):
+    logger.info("Starting all Roles in '%s/%s'", service_name, deployment_name)
+    deployment = sms.get_deployment_by_name(service_name, deployment_name)
+    op = sms.start_roles(service_name, deployment_name, [role.role_name for role in deployment.role_list])
+    wait_for_operation(sms, op)
+
+
+def stop(sms, service_name, deployment_name):
+    logger.info("Stopping all Roles in '%s/%s'", service_name, deployment_name)
+    deployment = sms.get_deployment_by_name(service_name, deployment_name)
+
+    # Here, Azure gives us the option to shutdown and stop paying for the instance (StoppedDeallocated), or just to
+    # shut down and continue paying. It's unclear what are the benefits of continuing to pay (maybe the VM boots
+    # up faster next time, and maybe the IP is retained). For demonstration purposes, we de-allocate the VM.
+    op = sms.shutdown_roles(service_name, deployment_name, [role.role_name for role in deployment.role_list],
+                            post_shutdown_action="StoppedDeallocated")
+    wait_for_operation(sms, op)
+
+
+
+def main():
     #################
     # Configuration #
     #################
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", required=True)
-    parser.add_argument('--provision', dest="vm_config")
-    parser.add_argument('--test-ssh', action='store_true')
-    parser.add_argument('--teardown', action='store_true')
+    parser.add_argument('--provision', dest="vm_config", help="Provision the VM as specifified in this file.")
+    parser.add_argument('--start', action='store_true', help="Start all the VMs")
+    parser.add_argument('--test-ssh', action='store_true', help="Test SSH on the VMs")
+    parser.add_argument('--stop', action='store_true', help="Stop all the VMs")
+    parser.add_argument('--snapshot', dest="snapshot_config", help="Snapshot all the VMs")
+    parser.add_argument('--teardown', action='store_true', help="Teardown the cluster (note: OS Images aren't deleted)")
     ns = parser.parse_args()
 
     # Those keys MUST be in the configuration file
-    config_keys = [
-            "subscription_id", "certificate_path",
-            "service_name", "service_location",
-            "deployment_name", "network_name",
-            "n_vms"]
-    with open(ns.config) as f:
-        config = json.load(f)
-    for cnf_key in config_keys:
-        try:
-            locals()[cnf_key] = config[cnf_key]
-        except KeyError:
-            logger.error("Missing configuration key: %s", cnf_key)
-            sys.exit(1)
+    config = attrdict_load(ns.config)
 
     ###################
     # Actual Workflow #
     ###################
 
-    sms = ServiceManagementService(subscription_id, certificate_path)
+    # Service Management is for VMs. Storage Service is for blobs (VHDs that back the VMs). The credentials
+    # use by each service are different.
+    sms = ServiceManagementService(config.service_management.subscription_id, config.service_management.certificate_path)
+    bs = BlobService(config.storage.account, config.storage.access_key)
 
     if ns.vm_config:
+        create_hosted_service(sms, config.service_name, config.service_location)
+
         vm_config = attrdict_load(ns.vm_config)
+        for _ in range(config.n_vms):
+            deploy_vm(sms, bs, config.service_name, config.deployment_name, config.network_name, config.containers.vhds, vm_config)
 
-        create_hosted_service(sms, service_name, service_location)
-
-        for _ in range(n_vms):
-            deploy_vm(sms, service_name, deployment_name, network_name, vm_config)
+    if ns.start:
+        start(sms, config.service_name, config.deployment_name)
 
     if ns.test_ssh:
-        test_ssh(sms, service_name, deployment_name)
+        test_ssh(sms, config.service_name, config.deployment_name)
+
+    if ns.stop:
+        stop(sms, config.service_name, config.deployment_name)
+
+    if ns.snapshot_config:
+        snapshot_config = attrdict_load(ns.snapshot_config)
+        snapshot(sms, bs, config.service_name, config.deployment_name, config.containers.images, snapshot_config)
 
     if ns.teardown:
-        teardown_hosted_service(sms, service_name)
+        teardown(sms, config.service_name)
+
+
+if __name__ == "__main__":
+    main()
